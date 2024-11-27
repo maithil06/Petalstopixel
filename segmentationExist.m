@@ -1,60 +1,67 @@
-function segmentationExist()
-    % Set the directory for images and labels
-    baseDir = 'D:\Computer Vision\data_for_moodle\data_for_moodle\';  % Adjust this path as necessary
-    imageDataDir = fullfile(baseDir, 'images_256');
-    labelDataDir = fullfile(baseDir, 'labels_256');
+imageDir = 'data_for_moodle/images_256/';
+labelDir = 'data_for_moodle/labels_256/';
+classNames = ["flower", "background"];
+pixelLabelID = [1, 3];
 
-    imds = imageDatastore(imageDataDir);
-    pxds = pixelLabelDatastore(labelDataDir, ["background", "flower"], [0 255]);
+imds = imageDatastore(imageDir);
+pxds = pixelLabelDatastore(labelDir, classNames, pixelLabelID, ...
+    'FileExtensions','.png','ReadFcn',@imread);
 
-    % Verify that labels are loaded
-    if isempty(pxds.Labels)
-        error('Labels property is empty. Ensure that label data is correctly loaded.');
-    end
+[imdsTrain, imdsVal, pxdsTrain, pxdsVal] = prepareData(imageDir, labelDir, classNames, pixelLabelID, 0.20);
 
-    % Display some info about the label datastore
-    disp("Label classes:");
-    disp(pxds.ClassNames);
-    disp("Number of labeled files:");
-    disp(length(pxds.Files));
+inputSize = [256 256 3];
+numClasses = numel(classNames);
+lgraph = deeplabv3plusLayers(inputSize, numClasses, "resnet18");
 
-    % Create an image data augmenter to perform random horizontal flipping
-    imageAugmenter = imageDataAugmenter('RandXReflection',true);
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 1e-3, ...
+    'MaxEpochs', 15, ...
+    'Shuffle', 'every-epoch', ...
+    'ValidationData', combine(imdsVal, pxdsVal), ...
+    'MiniBatchSize', 4, ...
+    'ValidationFrequency', 30, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'ExecutionEnvironment', 'gpu');  
 
-    % Set up training and validation data
-    [imdsTrain, imdsTest, pxdsTrain, pxdsTest] = partitionData(imds, pxds);
+net = trainNetwork(combine(imdsTrain, pxdsTrain), lgraph, options);
 
-    % Load a pre-trained network, modify it for two classes
-    net = segnetLayers([256 256 3], 2, 'vgg16');
+save('segmentexistnet_deeplabadam.mat', 'net');
+valResults = semanticseg(imdsVal,net);
+metrics = evaluateSemanticSegmentation(valResults,pxdsVal);
+metrics.NormalizedConfusionMatrix;
+rmdir('semanticsegOutput', 's');
 
-    % Check for GPU availability
-    executionEnvironment = 'auto';
-    if gpuDeviceCount > 0
-        executionEnvironment = 'gpu';
-    end
+function [imdsTrain, imdsVal, pxdsTrain, pxdsVal] = prepareData(imDir, labelDir, classNames, pixelLabelID, validationFraction)
+    
+    imds = imageDatastore(imDir);
+    pxds = pixelLabelDatastore(labelDir, classNames, pixelLabelID, ...
+        "ReadFcn", @(x) relabel(x, pixelLabelID, classNames));
+    
+    validImageFiles = removeNonMatchingFiles(imds.Files, pxds.Files);
+    imds = imageDatastore(validImageFiles);
+    assert(numel(imds.Files) == numel(pxds.Files), 'The number of images and labels must match after filtering.');
 
-    % Set training options with GPU usage
-    opts = trainingOptions('sgdm', ...
-        'InitialLearnRate',1e-3, ...
-        'MaxEpochs',20, ...
-        'MiniBatchSize',2, ...
-        'Shuffle','every-epoch', ...
-        'Plots','training-progress', ...
-        'VerboseFrequency',10, ...
-        'ExecutionEnvironment', executionEnvironment);
-
-    % Train the network
-    net = trainNetwork(imdsTrain, pxdsTrain, net.Layers, opts);
-
-    % Save the trained network
-    save('segmentexistnet.mat', 'net');
+    numFiles = numel(imds.Files);
+    indices = randperm(numFiles);
+    numValFiles = round(validationFraction * numFiles);
+    valIndices = indices(1:numValFiles);
+    trainIndices = indices(numValFiles+1:end);
+    imdsTrain = subset(imds, trainIndices);
+    imdsVal = subset(imds, valIndices);
+    pxdsTrain = subset(pxds, trainIndices);
+    pxdsVal = subset(pxds, valIndices);
 end
 
-function [imdsTrain, imdsTest, pxdsTrain, pxdsTest] = partitionData(imds, pxds)
-    % Partition data into training and testing, with a check for labels
-    if isempty(pxds.Labels)
-        error('Pixel Label Datastore must have non-empty Labels property to use splitEachLabel.');
-    end
-    [imdsTrain, imdsTest] = splitEachLabel(imds, 0.8, 'randomized');
-    [pxdsTrain, pxdsTest] = splitEachLabel(pxds, 0.8, 'randomized');
+function labelData = relabel(filePath, labelID, classNames)
+    labelData = imread(filePath);
+    labelData(labelData == 2 | labelData == 4 | labelData == 0) = 3; 
+    labelData = categorical(labelData, labelID, classNames);
+end
+
+function validFiles = removeNonMatchingFiles(imageFiles, labelFiles)
+    [~, imageNames] = cellfun(@fileparts, imageFiles, 'UniformOutput', false);
+    [~, labelNames] = cellfun(@fileparts, labelFiles, 'UniformOutput', false);
+    validIdx = ismember(imageNames, labelNames);
+    validFiles = imageFiles(validIdx);
 end
